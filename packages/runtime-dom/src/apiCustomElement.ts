@@ -22,10 +22,19 @@ import {
   ComponentOptions
 } from '@vue/runtime-core'
 import { camelize, extend, hyphenate, isArray, toNumber } from '@vue/shared'
+import HTMLParsedElement from 'html-parsed-element'
 import { hydrate, render } from '.'
 
 export type VueElementConstructor<P = {}> = {
   new (initialProps?: Record<string, any>): VueElement & P
+}
+
+export interface DefineCustomElementConfig {
+  /**
+   * Render inside a shadow root DOM element
+   * @default true
+   */
+  shadowRoot?: boolean
 }
 
 // defineCustomElement provides the same type inference as defineComponent
@@ -36,7 +45,8 @@ export function defineCustomElement<Props, RawBindings = object>(
   setup: (
     props: Readonly<Props>,
     ctx: SetupContext
-  ) => RawBindings | RenderFunction
+  ) => RawBindings | RenderFunction,
+  config?: DefineCustomElementConfig
 ): VueElementConstructor<Props>
 
 // overload 2: object format with no props
@@ -61,7 +71,8 @@ export function defineCustomElement<
     Extends,
     E,
     EE
-  > & { styles?: string[] }
+  > & { styles?: string[] },
+  config?: DefineCustomElementConfig
 ): VueElementConstructor<Props>
 
 // overload 3: object format with array props declaration
@@ -86,7 +97,8 @@ export function defineCustomElement<
     Extends,
     E,
     EE
-  > & { styles?: string[] }
+  > & { styles?: string[] },
+  config?: DefineCustomElementConfig
 ): VueElementConstructor<{ [K in PropNames]: any }>
 
 // overload 4: object format with object props declaration
@@ -111,37 +123,45 @@ export function defineCustomElement<
     Extends,
     E,
     EE
-  > & { styles?: string[] }
+  > & { styles?: string[] },
+  config?: DefineCustomElementConfig
 ): VueElementConstructor<ExtractPropTypes<PropsOptions>>
 
 // overload 5: defining a custom element from the returned value of
 // `defineComponent`
-export function defineCustomElement(options: {
-  new (...args: any[]): ComponentPublicInstance
-}): VueElementConstructor
+export function defineCustomElement(
+  options: {
+    new (...args: any[]): ComponentPublicInstance
+  },
+  config?: DefineCustomElementConfig
+): VueElementConstructor
 
 export function defineCustomElement(
   options: any,
+  config?: DefineCustomElementConfig,
   hydrate?: RootHydrateFunction
 ): VueElementConstructor {
   const Comp = defineComponent(options as any)
   class VueCustomElement extends VueElement {
     static def = Comp
     constructor(initialProps?: Record<string, any>) {
-      super(Comp, initialProps, hydrate)
+      super(Comp, initialProps, config, hydrate)
     }
   }
 
   return VueCustomElement
 }
 
-export const defineSSRCustomElement = ((options: any) => {
-  // @ts-ignore
-  return defineCustomElement(options, hydrate)
+export const defineSSRCustomElement = ((
+  options: any,
+  config?: DefineCustomElementConfig
+) => {
+  // @ts-expect-error
+  return defineCustomElement(options, config, hydrate)
 }) as typeof defineCustomElement
 
 const BaseClass = (
-  typeof HTMLElement !== 'undefined' ? HTMLElement : class {}
+  typeof HTMLElement !== 'undefined' ? HTMLParsedElement : class {}
 ) as typeof HTMLElement
 
 type InnerComponentDef = ConcreteComponent & { styles?: string[] }
@@ -156,27 +176,63 @@ export class VueElement extends BaseClass {
   private _resolved = false
   private _numberProps: Record<string, true> | null = null
   private _styles?: HTMLStyleElement[]
+  private _slots: Node[]
 
   constructor(
     private _def: InnerComponentDef,
     private _props: Record<string, any> = {},
+    private _config: DefineCustomElementConfig = {},
     hydrate?: RootHydrateFunction
   ) {
     super()
-    if (this.shadowRoot && hydrate) {
-      hydrate(this._createVNode(), this.shadowRoot)
-    } else {
-      if (__DEV__ && this.shadowRoot) {
-        warn(
-          `Custom element has pre-rendered declarative shadow root but is not ` +
-            `defined as hydratable. Use \`defineSSRCustomElement\`.`
-        )
+    this._config = extend(
+      {
+        shadowRoot: true
+      },
+      this._config
+    )
+
+    if (this._config.shadowRoot) {
+      if (this.shadowRoot && hydrate) {
+        hydrate(this._createVNode(), this._root!)
+      } else {
+        if (__DEV__ && this.shadowRoot) {
+          warn(
+            `Custom element has pre-rendered declarative shadow root but is not ` +
+              `defined as hydratable. Use \`defineSSRCustomElement\`.`
+          )
+        }
+        this.attachShadow({ mode: 'open' })
       }
-      this.attachShadow({ mode: 'open' })
+    } else {
+      if (hydrate) {
+        hydrate(this._createVNode(), this._root!)
+      }
     }
   }
 
+  get _root(): Element | ShadowRoot | null {
+    return this._config.shadowRoot ? this.shadowRoot : this
+  }
+
   connectedCallback() {
+    if (this._config.shadowRoot) {
+      this._connect()
+    } else {
+      super.connectedCallback()
+    }
+  }
+
+  // use of parsedCallback when shadowRoot is disabled
+  // to wait for slots to be parsed
+  // see https://stackoverflow.com/a/52884370
+  parsedCallback() {
+    if (!this._config.shadowRoot) {
+      this._connect()
+    }
+  }
+
+  _connect() {
     this._connected = true
     if (!this._instance) {
       this._resolveDef()
@@ -187,7 +243,7 @@ export class VueElement extends BaseClass {
     this._connected = false
     nextTick(() => {
       if (!this._connected) {
-        render(null, this.shadowRoot!)
+        render(null, this._root!)
         this._instance = null
       }
     })
@@ -221,7 +277,8 @@ export class VueElement extends BaseClass {
 
       // cast Number-type props set before resolve
       let numberProps
-      if (hasOptions) {
+      // add props check to fix https://github.com/vuejs/core/issues/5326
+      if (hasOptions && props) {
         for (const key in this._props) {
           const opt = props[key]
           if (opt === Number || (opt && opt.type === Number)) {
@@ -249,6 +306,12 @@ export class VueElement extends BaseClass {
             this._setProp(key, val)
           }
         })
+      }
+
+      // replace slot
+      if (!this._config.shadowRoot) {
+        this._slots = Array.from(this.children).map(n => n.cloneNode(true))
+        this.replaceChildren()
       }
 
       // apply CSS
@@ -309,21 +372,44 @@ export class VueElement extends BaseClass {
   }
 
   private _update() {
-    render(this._createVNode(), this.shadowRoot!)
+    render(this._createVNode(), this._root!)
   }
 
   private _createVNode(): VNode<any, any> {
-    const vnode = createVNode(this._def, extend({}, this._props))
+    let childs = null
+    // web components without shadow DOM do not supports native slot
+    // so, we create a VNode based on the content of child nodes.
+    // NB: named slots are currently not supported
+    if (!this._config.shadowRoot) {
+      childs = () => {
+        const toObj = (a: NamedNodeMap) => {
+          const res = {}
+          for (let i = 0, l = a.length; i < l; i++) {
+            const attr = a[i]
+            res[attr.nodeName] = attr.nodeValue
+          }
+          return res
+        }
+        return this._slots.map(n => {
+          const attrs = n.attributes ? toObj(n.attributes) : {}
+          attrs.innerHTML = n.innerHTML
+          return createVNode(n.tagName, attrs, null)
+        })
+      }
+    }
+    const vnode = createVNode(this._def, extend({}, this._props), childs)
     if (!this._instance) {
       vnode.ce = instance => {
         this._instance = instance
-        instance.isCE = true
+        if (this._config.shadowRoot) {
+          instance.isCE = true
+        }
         // HMR
         if (__DEV__) {
           instance.ceReload = newStyles => {
             // always reset styles
             if (this._styles) {
-              this._styles.forEach(s => this.shadowRoot!.removeChild(s))
+              this._styles.forEach(s => this._root!.removeChild(s))
               this._styles.length = 0
             }
             this._applyStyles(newStyles)
@@ -367,7 +453,7 @@ export class VueElement extends BaseClass {
       styles.forEach(css => {
         const s = document.createElement('style')
         s.textContent = css
-        this.shadowRoot!.appendChild(s)
+        this._root!.appendChild(s)
         // record for HMR
         if (__DEV__) {
           ;(this._styles || (this._styles = [])).push(s)
